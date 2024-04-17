@@ -210,7 +210,7 @@ def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, 
         input_ids, attention_mask, target_ids = [t.to(device, non_blocking=True) for t in batch]
         input_ids, target_ids = input_ids.t(), target_ids.t()
 
-        with torch.cuda.amp.autocast(args.mixed_precision, dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast(args.mixed_precision, dtype=torch.float16):
             prediction = model(input_ids, attention_mask, target_ids)
 
             target_ids = target_ids.flatten()

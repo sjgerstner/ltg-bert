@@ -73,10 +73,10 @@ class Dataset(Dataset):
         for i, segment in enumerate(open(file, "r")):
             if i % n_gpus != offset:
                 continue
-
             segment = segment.strip().split(" ")
-            assert len(segment) <= seq_length - 2, " ".join(segment)
-            segment = [self.tokenizer.token_to_id(token) for token in segment]
+            # assert len(segment) <= seq_length - 2, " ".join(segment)
+            # segment = [self.tokenizer.token_to_id(token) for token in segment]
+            segment = self.tokenizer.encode(segment[0]).ids[1:-1]
             self.segments.append(segment)
 
     def __len__(self):
