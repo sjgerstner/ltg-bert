@@ -46,6 +46,7 @@ def parse_arguments():
     parser.add_argument("--max_steps", default=31250 // 2, type=int, help="Total number of training steps to perform.")
     parser.add_argument("--long_after", default=0.9, type=float) 
     parser.add_argument("--warmup_proportion", default=0.016, type=float, help="Proportion of training to perform linear learning rate warmup for. E.g., 0.1 = 10%% of training.")
+    parser.add_argument("--gradient_accumulation_steps", default=1, type=int, help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument('--seed', type=int, default=42, help="random seed for initialization")
     parser.add_argument('--log_freq', type=int, default=10, help='frequency of logging loss.')
     parser.add_argument("--mask_p", default=0.15, type=float, help="Masking probability.")
@@ -206,13 +207,15 @@ def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, 
     else:
         train_iter = train_dataloader
 
+    gradients_accumulated = 0
+    accumulation_steps = args.gradient_accumulation_steps
+
     for local_step, batch in enumerate(train_iter):
         input_ids, attention_mask, target_ids = [t.to(device, non_blocking=True) for t in batch]
         input_ids, target_ids = input_ids.t(), target_ids.t()
 
         with torch.cuda.amp.autocast(args.mixed_precision, dtype=torch.float16):
             prediction = model(input_ids, attention_mask, target_ids)
-
             target_ids = target_ids.flatten()
             target_ids = target_ids[target_ids != -100]
             loss = F.cross_entropy(prediction, target_ids)
@@ -221,38 +224,36 @@ def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, 
             accuracy = (prediction.argmax(-1) == target_ids).float().mean()
 
         grad_scaler.scale(loss).backward()
-        grad_scaler.unscale_(optimizer)
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.max_gradient)
+        gradients_accumulated += 1
 
-        return_value = grad_scaler.step(optimizer)
-        grad_scaler.update()
+        if gradients_accumulated % accumulation_steps == 0:
+            grad_scaler.unscale_(optimizer)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.max_gradient)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            scheduler.step()
+            gradients_accumulated = 0
 
-        optimizer.zero_grad(set_to_none=True)
-        global_step += 1
+            if is_main_process():
+                train_iter.set_postfix_str(f"loss: {loss.item():.2f}, accuracy: {accuracy.item() * 100.0:.2f}, grad_norm: {grad_norm:.2f}, lr: {optimizer.param_groups[0]['lr']:.5f}")
 
-        if return_value is None:
-            continue
+                if global_step % 100 == 0:
+                    log_parameter_histograms(model, global_step)
 
-        scheduler.step()
-
-        if is_main_process():
-            train_iter.set_postfix_str(f"loss: {loss.item():.2f}, accuracy: {accuracy.item() * 100.0:.2f}, grad_norm: {grad_norm:.2f}, lr: {optimizer.param_groups[0]['lr']:.5f}")
-
-            if global_step % 100 == 0:
-                log_parameter_histograms(model, global_step)
-
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "train/loss": loss.item(),
-                    "train/accuracy": accuracy.item() * 100.0,
-                    "stats/learning_rate": optimizer.param_groups[0]['lr'],
-                    "stats/grad_norm": grad_norm,
-                    "stats/seq_length": data.seq_length,
-                    "stats/grad_scale": grad_scaler.get_scale()
-                },
-                step=global_step,
-            )
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "train/loss": loss.item(),
+                        "train/accuracy": accuracy.item() * 100.0,
+                        "stats/learning_rate": optimizer.param_groups[0]['lr'],
+                        "stats/grad_norm": grad_norm,
+                        "stats/seq_length": data.seq_length,
+                        "stats/grad_scale": grad_scaler.get_scale()
+                    },
+                    step=global_step,
+                )
 
         if global_step == int(args.device_max_steps * args.long_after):
             return global_step
