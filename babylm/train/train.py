@@ -266,7 +266,7 @@ def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, 
 
 
 def save(model, optimizer, grad_scaler, scheduler, global_step, epoch, args):
-    checkpoint_path = f"{args.output_dir}/model.bin"
+    checkpoint_path = f"{args.output_dir}/model_{epoch}.bin"
     if is_main_process():
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model itself
         torch.save(
@@ -339,7 +339,8 @@ if __name__ == "__main__":
             train_data, min_length = load_dataset(args, tokenizer, device)
 
         global_step = training_epoch(model, train_data, optimizer, scheduler, grad_scaler, global_step, epoch, args, device, min_length)
-        checkpoint_path = save(model, optimizer, grad_scaler, scheduler, global_step, epoch, args)
+        if epoch % 2 == 0:
+            checkpoint_path = save(model, optimizer, grad_scaler, scheduler, global_step, epoch, args)
 
         if global_step >= args.device_max_steps:
             break
