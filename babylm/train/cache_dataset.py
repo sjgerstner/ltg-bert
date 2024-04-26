@@ -4,11 +4,11 @@ from tqdm import tqdm
 
 
 SEQ_LEN = 128 - 2
-tokenizer = Tokenizer.from_file("../tokenizer_10M_elcbert.json")
+tokenizer = Tokenizer.from_file("../tokenizer.json")
 
 
 documents = [[]]
-for line in tqdm(open("../data/processed_10M/segmented.txt")):
+for line in tqdm(open("../data/processed_100M/segmented.txt")):
     line = line.strip()
 
     if len(line) == 0:
@@ -20,7 +20,7 @@ for line in tqdm(open("../data/processed_10M/segmented.txt")):
     documents[-1].append(ids)
 
 
-with open(f"../data/processed_10M/cached_train_{SEQ_LEN + 2}.txt", "w") as f:
+with open(f"../data/processed_100M/cached_train_{SEQ_LEN + 2}.txt", "w") as f:
     for document in tqdm(documents):
         segment = []
         for i, sentence in enumerate(document):

@@ -58,13 +58,17 @@ fi
 grad_accum=5
 steps=$((31250 * $grad_accum))
 
+seed=$1
+
 
 srun singularity exec --nv \
 --overlay /scratch/myh2014/singularity/50G.ext3:ro \
 --bind /opt/slurm/etc,/var/run/munge,/opt/slurm/etc:/ext3/slurm/etc:ro,${etc_passwd}:/etc/passwd:ro \
 /scratch/work/public/singularity/cuda11.8.86-cudnn8.7-devel-ubuntu22.04.2.sif  /bin/bash -c \
 "source /ext3/env.sh; conda activate tpr; \
-python train.py --batch_size 128 --max_steps $steps --input_path ../data/processed_10M/cached_train_128.txt --config_file ../configs/ltgbert_small_elc_tok.json --output_dir ../checkpoints/ltgbert_small_elc_tok --vocab_path ../tokenizer_10M_elcbert.json --gradient_accumulation_steps $grad_accum"
+python train.py --batch_size 64 --max_steps $steps --input_path ../data/processed_100M/cached_train_128.txt --config_file ../configs/base.json --output_dir ../checkpoints/ltgbert_base --vocab_path ../tokenizer.json --gradient_accumulation_steps $grad_accum --seed $seed"
+
+# python train.py --batch_size 128 --max_steps $steps --input_path ../data/processed_10M/cached_train_128.txt --config_file ../configs/ltgbert_small_elc_tok.json --output_dir ../checkpoints/ltgbert_small_elc_tok --vocab_path ../tokenizer_10M_elcbert.json --gradient_accumulation_steps $grad_accum"
 
 # srun singularity exec --nv \
 # --overlay /scratch/myh2014/singularity/50G.ext3:ro \
