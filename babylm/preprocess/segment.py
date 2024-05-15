@@ -2,8 +2,8 @@ import nltk
 import sys
 
 
-input_path = f"../data/processed_{sys.argv[1]}/all.txt"
-output_path = f"../data/processed_{sys.argv[1]}/segmented.txt"
+input_path = f"../data/processed_{sys.argv[1]}/{sys.argv[2]}.txt"
+output_path = f"../data/processed_{sys.argv[1]}/{sys.argv[2]}_segmented.txt"
 
 with open(output_path, "w") as f:
     for line in open(input_path):
