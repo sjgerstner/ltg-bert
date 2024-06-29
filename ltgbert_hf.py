@@ -946,17 +946,19 @@ class LtgBertForMultipleChoice(LtgBertModel):
             attentions=attention_probs if output_attentions else None
         )
 
-def main(model_pth, tokenizer_pth, output_pth):
+def main(model_pth, tokenizer_pth, output_pth, is_small=True):
     '''
     Method for converting trained model.bin files into huggingface format
     '''
-    # TODO: make compatible with 100M model
-    config = LtgBertSmallConfig()
+    if is_small:
+        config = LtgBertSmallConfig()
+    else:
+        config = LtgBertConfig()
     model = LtgBertForMaskedLM(config)
-
+    print(model)
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_pth)
     checkpoint = torch.load(model_pth, map_location='cpu')
-
+    print(checkpoint)
     model.load_state_dict(checkpoint['model'])
 
     model.save_pretrained(output_pth, safe_serialization=False)

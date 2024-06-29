@@ -11,9 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel
 
 from tokenizers import Tokenizer
+from transformers import DataCollatorForLanguageModeling
+
 from lamb import Lamb
 from config import BertConfig
 
@@ -23,8 +26,8 @@ from utils import cosine_schedule_with_warmup, is_main_process, get_rank, seed_e
 from dataset import Dataset
 
 
-if int(os.environ["SLURM_PROCID"]) == 0:
-    import wandb
+# if int(os.environ["SLURM_PROCID"]) == 0:
+#     import wandb
 
 
 def parse_arguments():
@@ -60,44 +63,44 @@ def parse_arguments():
     return args
 
 
-@torch.no_grad()
-def log_parameter_histograms(model, step):
-    for name, param in model.named_parameters():
-        wandb.log(
-            {
-                f"parameters/norm_{name}": torch.linalg.norm(param.data).cpu().item(),
-                f"parameters/std_{name}": param.data.std().cpu().item(),
-            },
-            step=step,
-            commit=False
-        )
-        if param.requires_grad and param.grad is not None:
-            wandb.log(
-                {
-                    f"gradients/norm_{name}": torch.linalg.norm(param.grad).cpu().item(),
-                    f"gradients/std_{name}": param.grad.std().cpu().item(),
-                },
-                step=step,
-                commit=False
-            )
+# @torch.no_grad()
+# def log_parameter_histograms(model, step):
+#     for name, param in model.named_parameters():
+#         wandb.log(
+#             {
+#                 f"parameters/norm_{name}": torch.linalg.norm(param.data).cpu().item(),
+#                 f"parameters/std_{name}": param.data.std().cpu().item(),
+#             },
+#             step=step,
+#             commit=False
+#         )
+#         if param.requires_grad and param.grad is not None:
+#             wandb.log(
+#                 {
+#                     f"gradients/norm_{name}": torch.linalg.norm(param.grad).cpu().item(),
+#                     f"gradients/std_{name}": param.grad.std().cpu().item(),
+#                 },
+#                 step=step,
+#                 commit=False
+#             )
 
 
 def setup_training(args):
     assert torch.cuda.is_available()
     args.n_gpu = torch.cuda.device_count()
 
-    world_size = int(os.environ["WORLD_SIZE"])
-    rank = int(os.environ["SLURM_PROCID"])
+    torch.distributed.init_process_group(backend="nccl")
+    if is_main_process():
+        print(f"Group initialized? {torch.distributed.is_initialized()}", flush=True)
+
+    world_size = get_world_size()
+    rank = get_rank()
     gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
     assert gpus_per_node == torch.cuda.device_count()
     print(f"Hello from rank {rank} of {world_size} on {gethostname()} where there are" \
           f" {gpus_per_node} allocated GPUs per node.", flush=True)
 
     seed_everything(args.seed + rank)
-
-    torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    if rank == 0:
-        print(f"Group initialized? {torch.distributed.is_initialized()}", flush=True)
 
     local_rank = rank - gpus_per_node * (rank // gpus_per_node)
     torch.cuda.set_device(local_rank)
@@ -114,14 +117,14 @@ def setup_training(args):
 
     args.device_max_steps = args.max_steps
 
-    if is_main_process():
-        wandb.init(
-            name="LTG-BERT base",
-            config=args,
-            id=args.wandb_id,
-            project="BABY-LM",
-            entity="ltg"
-        )
+    # if is_main_process():
+    #     wandb.init(
+    #         name="LTG-BERT base",
+    #         config=args,
+    #         id=args.wandb_id,
+    #         project="BABY-LM",
+    #         entity="ltg"
+    #     )
 
     return device, local_rank
 
@@ -132,8 +135,8 @@ def prepare_model_and_optimizer(args, device, local_rank, checkpoint):
 
     if is_main_process():
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        wandb.config.update(config.to_dict())
-        wandb.config.update({"n_params": n_params})
+        # wandb.config.update(config.to_dict())
+        # wandb.config.update({"n_params": n_params})
         print(model)
         print(f"NUMBER OF PARAMETERS: {n_params}\n", flush=True)
 
@@ -159,7 +162,7 @@ def prepare_model_and_optimizer(args, device, local_rank, checkpoint):
         for n, _ in decay_params:
             print(n)
         print(flush=True)
-
+    #print('(preparing optimizer)')
     if args.optimizer == "adam" or args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
@@ -174,9 +177,11 @@ def prepare_model_and_optimizer(args, device, local_rank, checkpoint):
             betas=(0.9, 0.98),
             eps=1e-6,
         )
-
+    #print('(done)')
+    #print('(preparing scheduler)')
     scheduler = cosine_schedule_with_warmup(optimizer, int(args.device_max_steps * args.warmup_proportion), args.device_max_steps, 0.1)
-
+    #print('(done)')
+    #print('(preparing model)')
     model = DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -185,9 +190,10 @@ def prepare_model_and_optimizer(args, device, local_rank, checkpoint):
         gradient_as_bucket_view=True,
         static_graph=True
     )
-
+    #print('(done)')
+    #print('(preparing grad_scaler)')
     grad_scaler = torch.cuda.amp.GradScaler(enabled=args.mixed_precision)
-
+    #print('(done)')
     if checkpoint is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -196,14 +202,14 @@ def prepare_model_and_optimizer(args, device, local_rank, checkpoint):
     return model, config, optimizer, scheduler, grad_scaler
 
 
-def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, epoch, args, device, max_local_steps):
-    train_dataloader = create_train_dataloader(data, args, global_step, args.seed + get_rank() + epoch * get_world_size())
+def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, epoch, args, device, max_local_steps, tokenizer=None):
+    train_dataloader = create_train_dataloader(data, args, global_step, args.seed + get_rank() + epoch * get_world_size(), tokenizer=tokenizer)
 
     model = model.train()
     optimizer.zero_grad(set_to_none=True)
 
     if is_main_process():
-        train_iter = tqdm(train_dataloader, desc="Train iteration", initial=global_step, total=args.device_max_steps)
+        train_iter = tqdm(train_dataloader, desc="Train iteration", initial=global_step, total=max_local_steps*args.epochs)
     else:
         train_iter = train_dataloader
 
@@ -211,7 +217,10 @@ def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, 
     accumulation_steps = args.gradient_accumulation_steps
 
     for local_step, batch in enumerate(train_iter):
-        input_ids, attention_mask, target_ids = [t.to(device, non_blocking=True) for t in batch]
+        if local_step==0:
+            print(batch)
+            print(tokenizer.decode(batch['input_ids'][0]))
+        input_ids, attention_mask, target_ids = [t.to(device, non_blocking=True) for t in batch.values()]
         input_ids, target_ids = input_ids.t(), target_ids.t()
 
         with torch.cuda.amp.autocast(args.mixed_precision, dtype=torch.float16):
@@ -230,38 +239,50 @@ def training_epoch(model, data, optimizer, scheduler, grad_scaler, global_step, 
             grad_scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.max_gradient)
             grad_scaler.step(optimizer)
+            old_scale = grad_scaler.get_scale()
             grad_scaler.update()
+            new_scale = grad_scaler.get_scale()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
-            scheduler.step()
+            if new_scale>=old_scale:
+                scheduler.step() #otherwise optimizer.step() wasn't called
             gradients_accumulated = 0
 
             if is_main_process():
                 train_iter.set_postfix_str(f"loss: {loss.item():.2f}, accuracy: {accuracy.item() * 100.0:.2f}, grad_norm: {grad_norm:.2f}, lr: {optimizer.param_groups[0]['lr']:.5f}")
 
-                if global_step % 100 == 0:
-                    log_parameter_histograms(model, global_step)
+                # if global_step % 100 == 0:
+                #     log_parameter_histograms(model, global_step)
 
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        "train/loss": loss.item(),
-                        "train/accuracy": accuracy.item() * 100.0,
-                        "stats/learning_rate": optimizer.param_groups[0]['lr'],
-                        "stats/grad_norm": grad_norm,
-                        "stats/seq_length": data.seq_length,
-                        "stats/grad_scale": grad_scaler.get_scale()
-                    },
-                    step=global_step,
-                )
+                # wandb.log(
+                #     {
+                #         "epoch": epoch,
+                #         "train/loss": loss.item(),
+                #         "train/accuracy": accuracy.item() * 100.0,
+                #         "stats/learning_rate": optimizer.param_groups[0]['lr'],
+                #         "stats/grad_norm": grad_norm,
+                #         "stats/seq_length": data.seq_length,
+                #         "stats/grad_scale": grad_scaler.get_scale()
+                #     },
+                #     step=global_step,
+                # )
 
-        if global_step == int(args.device_max_steps * args.long_after):
-            return global_step
+        #if global_step == int(args.device_max_steps * args.long_after):
+        #    if is_main_process():
+        #        print('local step', local_step)
+        #        print('global step', global_step)
+        #        print('global_step reached max_steps')
+        #    return global_step
 
         # Exiting the training due to hitting max steps
-        if global_step >= args.device_max_steps or local_step >= max_local_steps - 1:
-            return global_step
-
+        #if global_step >= args.device_max_steps or local_step >= max_local_steps - 1:
+        #    if is_main_process():
+        #        print('local step', local_step)
+        #        print('global step', global_step)
+        #        print('local_step reached max')
+        #    return global_step
+    if is_main_process():
+        print('finished iterating over all data points (in the main process)')
     return global_step
 
 
@@ -302,16 +323,50 @@ def load_dataset(args, tokenizer, device):
     return train_data, min_length
 
 
-def create_train_dataloader(data, args, global_step, seed):
-    batch_size = args.batch_size // 4 if global_step >= int(args.device_max_steps * args.long_after) else args.batch_size
+# def create_train_dataloader(data, args, global_step, seed):
+#     batch_size = args.batch_size // 4 if global_step >= int(args.device_max_steps * args.long_after) else args.batch_size
+#     train_dataloader = DataLoader(
+#         data,
+#         shuffle=True,
+#         batch_size=batch_size,
+#         num_workers=7 - 1,
+#         generator=torch.Generator().manual_seed(seed),
+#         drop_last=True,
+#         pin_memory=True
+#     )
+#     return train_dataloader
+
+class ContextualizerDataCollatorNoPad(DataCollatorForLanguageModeling):
+    def torch_mask_tokens(self, inputs: torch.Tensor, **kargs) -> torch.Tensor:
+        """
+        This method overrides the original to mask 100% of the selected tokens with the mask token,
+        except for [PAD] tokens. Labels for [PAD] are also set to -100.
+        """
+        labels = inputs.clone()
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            raise ValueError("tokenizer.pad_token_id not set. Ensure your tokenizer is properly configured.")
+        mask = torch.full(labels.shape, self.mlm_probability).bernoulli().bool()
+        padding_mask = inputs.eq(pad_token_id)
+        mask &= ~padding_mask
+        inputs[mask] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+        labels[~mask] = -100
+        labels[padding_mask] = -100
+        return inputs, labels
+
+def create_train_dataloader(data, args, global_step, seed, tokenizer):
+    """Used in training_epoch()."""
+    batch_size = args.batch_size
     train_dataloader = DataLoader(
         data,
-        shuffle=True,
+        shuffle=False,#CHANGED so that the clean-noisy-clean sequence of the contextualizer makes sense
         batch_size=batch_size,
-        num_workers=7 - 1,
+        num_workers=4,#should match number of cpus (?)
         generator=torch.Generator().manual_seed(seed),
         drop_last=True,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=ContextualizerDataCollatorNoPad(tokenizer=tokenizer),#new
+        sampler=DistributedSampler(data, shuffle=False),#new, would presumably not be needed if dataset were already split by node
     )
     return train_dataloader
 
@@ -327,7 +382,7 @@ if __name__ == "__main__":
         args = argparse.Namespace(**args)
     else:
         checkpoint, initial_epoch, global_step = None, 0, 0
-        args.wandb_id = wandb.util.generate_id() if int(os.environ["SLURM_PROCID"]) == 0 else 0
+        # args.wandb_id = wandb.util.generate_id() if int(os.environ["SLURM_PROCID"]) == 0 else 0
 
     tokenizer = Tokenizer.from_file(args.vocab_path)
     device, local_rank = setup_training(args)
