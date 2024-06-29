@@ -21,6 +21,7 @@ from lamb import Lamb
 from config import BertConfig
 
 from model import Bert
+from elcbert import ELCBert
 
 from utils import cosine_schedule_with_warmup, is_main_process, get_rank, seed_everything, get_world_size
 from dataset import Dataset
@@ -39,6 +40,7 @@ def parse_arguments():
     parser.add_argument("--output_dir", default="../checkpoints/base", type=str, help="The output directory where the model checkpoints will be written.")
     parser.add_argument("--vocab_path", default="../tokenizer.json", type=str, help="The vocabulary the BERT model will train on.")
     parser.add_argument("--checkpoint_path", default=None, type=str, help="Path to a previous checkpointed training state.")
+    parser.add_argument("--model_type", choices=['ltgbert', 'elcbert'], default='ltgbert', type=str, help="The type of model to train.")
 
     # Other parameters
     parser.add_argument("--optimizer", default="lamb", type=str)
@@ -131,7 +133,10 @@ def setup_training(args):
 
 def prepare_model_and_optimizer(args, device, local_rank, checkpoint):
     config = BertConfig(args.config_file)
-    model = Bert(config, args.activation_checkpointing)
+    if args.model_type == 'ltgbert':
+        model = Bert(config, args.activation_checkpointing)
+    elif args.model_type == 'elcbert':
+        model = ELCBert(config, args.activation_checkpointing)
 
     if is_main_process():
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -376,13 +381,18 @@ if __name__ == "__main__":
 
     if args.checkpoint_path is not None:
         checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
-        checkpoint_args, initial_epoch, global_step = checkpoint["args"], checkpoint["epoch"] + 1, checkpoint["global_step"]
-        args = vars(args).copy()
-        args.update(vars(checkpoint_args))
-        args = argparse.Namespace(**args)
+        _, initial_epoch, global_step = checkpoint["args"], checkpoint["epoch"] + 1, checkpoint["global_step"]
+        # args = vars(args).copy()
+        # args.update(vars(checkpoint_args))
+        # args = argparse.Namespace(**args)
     else:
         checkpoint, initial_epoch, global_step = None, 0, 0
+
         # args.wandb_id = wandb.util.generate_id() if int(os.environ["SLURM_PROCID"]) == 0 else 0
+
+    
+
+
 
     tokenizer = Tokenizer.from_file(args.vocab_path)
     device, local_rank = setup_training(args)
@@ -394,7 +404,8 @@ if __name__ == "__main__":
             train_data, min_length = load_dataset(args, tokenizer, device)
 
         global_step = training_epoch(model, train_data, optimizer, scheduler, grad_scaler, global_step, epoch, args, device, min_length)
-        if epoch % 10 == 0:
+        
+        if (epoch+1) % 2 == 0:
             checkpoint_path = save(model, optimizer, grad_scaler, scheduler, global_step, epoch, args)
 
         if global_step >= args.device_max_steps:

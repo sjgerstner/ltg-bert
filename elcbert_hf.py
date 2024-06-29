@@ -40,33 +40,12 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from transformers.configuration_utils import PretrainedConfig
 from transformers import PreTrainedTokenizerFast
 
+# NB: this is not the same as ltgbert_hf.py! Look at the Encoder for example.
+# However, the authors named the model the same as the one in ltgbert_hf.py, unfortunately.
 
 
 _CHECKPOINT_FOR_DOC = "ltg/bnc-bert-span"
 _CONFIG_FOR_DOC = "LtgBertConfig"
-
-LTG_BERT_PRETRAINED_CONFIG_ARCHIVE_MAP = {
-    "bnc-bert-span": "https://huggingface.co/ltg/bnc-bert-span",
-    "bnc-bert-span-2x": "https://huggingface.co/ltg/bnc-bert-span-2x",
-    "bnc-bert-span-0.5x": "https://huggingface.co/ltg/bnc-bert-span-0.5x",
-    "bnc-bert-span-0.25x": "https://huggingface.co/ltg/bnc-bert-span-0.25x",
-    "bnc-bert-span-order": "https://huggingface.co/ltg/bnc-bert-span-order",
-    "bnc-bert-span-document": "https://huggingface.co/ltg/bnc-bert-span-document",
-    "bnc-bert-span-word": "https://huggingface.co/ltg/bnc-bert-span-word",
-    "bnc-bert-span-subword": "https://huggingface.co/ltg/bnc-bert-span-subword",
-
-    "norbert3-xs": "https://huggingface.co/ltg/norbert3-xs/config.json",
-    "norbert3-small": "https://huggingface.co/ltg/norbert3-small/config.json",
-    "norbert3-base": "https://huggingface.co/ltg/norbert3-base/config.json",
-    "norbert3-large": "https://huggingface.co/ltg/norbert3-large/config.json",
-
-    "norbert3-oversampled-base": "https://huggingface.co/ltg/norbert3-oversampled-base/config.json",
-    "norbert3-ncc-base": "https://huggingface.co/ltg/norbert3-ncc-base/config.json",
-    "norbert3-nak-base": "https://huggingface.co/ltg/norbert3-nak-base/config.json",
-    "norbert3-nb-base": "https://huggingface.co/ltg/norbert3-nb-base/config.json",
-    "norbert3-wiki-base": "https://huggingface.co/ltg/norbert3-wiki-base/config.json",
-    "norbert3-c4-base": "https://huggingface.co/ltg/norbert3-c4-base/config.json"
-}
 
 
 class LtgBertConfig(PretrainedConfig):
@@ -224,7 +203,7 @@ LTG_BERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
 class Encoder(nn.Module):
     def __init__(self, config, activation_checkpointing=False):
         super().__init__()
-        self.layers = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([EncoderLayer(config, i) for i in range(config.num_hidden_layers)])
 
         for i, layer in enumerate(self.layers):
             layer.mlp.mlp[1].weight.data *= math.sqrt(1.0 / (2.0 * (1 + i)))
@@ -237,9 +216,9 @@ class Encoder(nn.Module):
 
         for layer in self.layers:
             if self.activation_checkpointing:
-                hidden_state, attention_p = checkpoint.checkpoint(layer, hidden_states[-1], attention_mask, relative_embedding)
+                hidden_state, attention_p = checkpoint.checkpoint(layer, hidden_states, attention_mask, relative_embedding)
             else:
-                hidden_state, attention_p = layer(hidden_states[-1], attention_mask, relative_embedding)
+                hidden_state, attention_p = layer(hidden_states, attention_mask, relative_embedding)
 
             hidden_states.append(hidden_state)
             attention_probs.append(attention_p)
@@ -275,14 +254,21 @@ class MaskClassifier(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         self.attention = Attention(config)
         self.mlp = FeedForward(config)
+        temp = torch.zeros(layer_num+1)
+        temp[-1] = 1
+        self.prev_layer_weights = nn.Parameter(temp)
 
-    def forward(self, x, padding_mask, relative_embedding):
+    def forward(self, hidden_states, padding_mask, relative_embedding):
+        prev_layer_weights = F.softmax(self.prev_layer_weights, dim=-1)
+        x = prev_layer_weights[0] * hidden_states[0]
+        for i, hidden_state in enumerate(hidden_states[1:]):
+            x = x + prev_layer_weights[i+1] * hidden_state
         attention_output, attention_probs = self.attention(x, padding_mask, relative_embedding)
-        x = x + attention_output
+        x =  attention_output
         x = x + self.mlp(x)
         return x, attention_probs
 
@@ -402,8 +388,10 @@ class Attention(nn.Module):
 
         attention_scores = torch.bmm(query, key.transpose(1, 2) * self.scale)
 
-        pos = self.in_proj_qk(self.dropout(relative_embedding))  # shape: [2T-1, 2D]
-        query_pos, key_pos = pos.view(-1, self.num_heads, 2*self.head_size).chunk(2, dim=2)
+        query_pos, key_pos = self.in_proj_qk(self.dropout(relative_embedding)).chunk(2, dim=-1)  # shape: [2T-1, D]
+        query_pos = query_pos.view(-1, self.num_heads, self.head_size)  # shape: [2T-1, H, D]
+        key_pos = key_pos.view(-1, self.num_heads, self.head_size)  # shape: [2T-1, H, D]
+
         query = query.view(batch_size, self.num_heads, query_len, self.head_size)
         key = key.view(batch_size, self.num_heads, query_len, self.head_size)
 
@@ -955,10 +943,12 @@ def main(model_pth, tokenizer_pth, output_pth, is_small=True):
     else:
         config = LtgBertConfig()
     model = LtgBertForMaskedLM(config)
-    print(model)
+
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_pth)
     checkpoint = torch.load(model_pth, map_location='cpu')
-    print(checkpoint)
+
+    # breakpoint()
+
     model.load_state_dict(checkpoint['model'])
     # breakpoint()
 
